@@ -847,6 +847,129 @@ def delete_items(items, permanent=False):
 
 
 # ----------------------------------------------------------------------------
+# DESINSTALADOR EM LOTE
+# ----------------------------------------------------------------------------
+_SKIP_NAMES = re.compile(r"^(KB\d+|Update for|Security Update|Hotfix|"
+                         r"Microsoft Visual C\+\+ .*Redistributable.*\(x\d\d\)$)", re.I)
+
+
+def _rv(sk, name, default=""):
+    import winreg
+    try:
+        return winreg.QueryValueEx(sk, name)[0]
+    except OSError:
+        return default
+
+
+def list_uninstallable(show_redist=False):
+    """Programas desinstalaveis (sem componentes de sistema e atualizacoes)."""
+    if not IS_WIN:
+        return []
+    import winreg
+    base = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    roots = [(winreg.HKEY_LOCAL_MACHINE, base),
+             (winreg.HKEY_LOCAL_MACHINE, base.replace("SOFTWARE\\", "SOFTWARE\\WOW6432Node\\")),
+             (winreg.HKEY_CURRENT_USER, base)]
+    items, seen = [], set()
+    for hive, path in roots:
+        try:
+            k = winreg.OpenKey(hive, path)
+        except OSError:
+            continue
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(k, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                sk = winreg.OpenKey(k, sub)
+            except OSError:
+                continue
+            name = str(_rv(sk, "DisplayName")).strip()
+            if not name or _rv(sk, "SystemComponent", 0) == 1 or _rv(sk, "ParentKeyName"):
+                continue
+            if _SKIP_NAMES.search(name) and not show_redist:
+                continue
+            uni = str(_rv(sk, "UninstallString")).strip()
+            quiet = str(_rv(sk, "QuietUninstallString")).strip()
+            if not uni and not quiet:
+                continue
+            ver = str(_rv(sk, "DisplayVersion"))
+            if (name.lower(), ver) in seen:
+                continue
+            seen.add((name.lower(), ver))
+            d = str(_rv(sk, "InstallDate"))
+            if re.fullmatch(r"\d{8}", d):
+                d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            items.append(dict(
+                name=name, version=ver, publisher=str(_rv(sk, "Publisher")),
+                date=d, size=int(_rv(sk, "EstimatedSize", 0) or 0) * 1024,
+                uninstall=uni, quiet=quiet, reg=(hive, path, sub)))
+    items.sort(key=lambda x: x["name"].lower())
+    return items
+
+
+def build_uninstall_cmd(p, silent=True):
+    """Devolve (comando, e_silencioso)."""
+    q, u = p.get("quiet", "").strip(), p.get("uninstall", "").strip()
+    if silent and q:
+        return q, True
+    m = re.search(r"msiexec(?:\.exe)?\s+/[IX]\s*(\{[0-9A-F-]+\})", u, re.I)
+    if m:
+        flags = "/qn /norestart" if silent else "/norestart"
+        return f"msiexec.exe /x {m.group(1)} {flags}", silent
+    return u, False
+
+
+def still_installed(p):
+    if not IS_WIN:
+        return False
+    import winreg
+    hive, path, sub = p["reg"]
+    try:
+        winreg.OpenKey(hive, path + "\\" + sub)
+        return True
+    except OSError:
+        return False
+
+
+def create_restore_point(desc="SysGuard - antes de desinstalar"):
+    if not IS_WIN:
+        return False
+    out = powershell(f"Checkpoint-Computer -Description '{desc}' "
+                     "-RestorePointType APPLICATION_UNINSTALL -ErrorAction Stop; 'OK'", 90)
+    ok = "OK" in out
+    log("Ponto de restauracao " + ("criado" if ok else f"nao criado: {out.strip()[:200]}"))
+    return ok
+
+
+def uninstall_one(p, silent=True, timeout=1800):
+    """Executa o desinstalador e confere no registro. Devolve (status, detalhe)."""
+    cmd, is_silent = build_uninstall_cmd(p, silent)
+    if not cmd:
+        return "falha", "sem comando de desinstalacao"
+    log(f"DESINSTALAR: {p['name']} -> {cmd}")
+    try:
+        flags = 0x08000000 if (IS_WIN and is_silent) else 0
+        rc = subprocess.run(cmd, shell=True, timeout=timeout, creationflags=flags).returncode
+    except subprocess.TimeoutExpired:
+        return "falha", "tempo esgotado"
+    except OSError as e:
+        return "falha", str(e)
+    for _ in range(20):  # alguns desinstaladores terminam em segundo plano
+        if not still_installed(p):
+            break
+        time.sleep(1)
+    gone = not still_installed(p)
+    log(f"  codigo {rc}, removido={gone}")
+    if gone:
+        return "ok", "reiniciar o PC pode ser necessario" if rc == 3010 else ""
+    return "falha", f"codigo {rc}; o programa ainda aparece instalado (cancelado ou precisa de admin)"
+
+
+# ----------------------------------------------------------------------------
 # INTERFACE
 # ----------------------------------------------------------------------------
 BG, BG2, FG, ACC = "#1b1d24", "#262932", "#e8e8ec", "#4f8cff"
@@ -902,6 +1025,7 @@ class App(tk.Tk):
         self.tab_disk()
         self.tab_integrity()
         self.tab_scan()
+        self.tab_uninstall()
         self.tab_clean()
         self.tab_log()
         self.status = tk.StringVar(value="Pronto.")
@@ -1521,6 +1645,154 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, msg)
             self.say("Concluido.")
         self.bg(delete_items, done, items, perm)
+
+    # ---- aba DESINSTALADOR -------------------------------------------------------
+    def tab_uninstall(self):
+        f = ttk.Frame(self.nb, padding=10)
+        self.nb.add(f, text="Desinstalador")
+        ttk.Label(f, style="Sub.TLabel", wraplength=1000,
+                  text="Marque varios programas e desinstale todos de uma vez (um apos o outro). "
+                       "Programas sem modo silencioso abrem o desinstalador proprio deles.").pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(fill="x", pady=6)
+        ttk.Label(row, text="Buscar:").pack(side="left")
+        self.un_filter = tk.StringVar()
+        self.un_filter.trace_add("write", lambda *a: self.un_render())
+        ttk.Entry(row, textvariable=self.un_filter, width=30).pack(side="left", padx=(4, 10))
+        ttk.Button(row, text="Atualizar lista", command=self.un_load).pack(side="left", padx=(0, 10))
+        self.un_silent = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Silencioso quando possivel", variable=self.un_silent).pack(side="left", padx=(0, 10))
+        self.un_restore = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Criar ponto de restauracao", variable=self.un_restore).pack(side="left")
+        fr, self.un_tree = make_tree(f, [
+            ("chk", "", 34, "center"), ("name", "Programa", 330, "w"),
+            ("ver", "Versao", 110, "w"), ("pub", "Fabricante", 220, "w"),
+            ("size", "Tamanho", 90, "e"), ("date", "Instalado", 100, "w")], height=15)
+        fr.pack(fill="both", expand=True)
+        self.un_items, self.un_checked, self.un_sort = [], set(), ("name", False)
+        for cid, key in (("name", "name"), ("ver", "version"), ("pub", "publisher"),
+                         ("size", "size"), ("date", "date")):
+            self.un_tree.heading(cid, text=self.un_tree.heading(cid)["text"],
+                                 command=lambda k=key: self.un_sort_by(k))
+        self.un_tree.bind("<Button-1>", self.un_click)
+        row2 = ttk.Frame(f)
+        row2.pack(fill="x", pady=6)
+        ttk.Button(row2, text="Marcar visiveis", command=lambda: self.un_mark(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(row2, text="Desmarcar todos", command=lambda: self.un_mark(False)).pack(side="left", padx=(0, 6))
+        self.un_sum = tk.StringVar()
+        ttk.Label(row2, textvariable=self.un_sum, foreground=ACC).pack(side="left", padx=10)
+        self.un_btn = ttk.Button(row2, text="Desinstalar marcados", style="Danger.TButton",
+                                 command=self.un_run)
+        self.un_btn.pack(side="right")
+        ttk.Button(row2, text="Parar apos o atual", command=self.cancel_flag.set).pack(side="right", padx=6)
+        self.un_prog = ttk.Progressbar(f, maximum=1.0)
+        self.un_prog.pack(fill="x")
+        self.un_loaded = False
+        self.nb.bind("<<NotebookTabChanged>>", self._tab_changed)
+
+    def _tab_changed(self, _ev=None):
+        if self.nb.tab(self.nb.select(), "text") == "Desinstalador" and not self.un_loaded:
+            self.un_load()
+
+    def un_load(self):
+        if not IS_WIN:
+            messagebox.showinfo(APP_NAME, "O desinstalador funciona apenas no Windows.")
+            return
+        self.un_loaded = True
+        self.say("Lendo programas instalados...")
+
+        def done(r, e):
+            self.un_items = r or []
+            self.un_checked.clear()
+            self.un_render()
+            self.say(f"{len(self.un_items)} programas." + (f" Erro: {e}" if e else ""))
+        self.bg(list_uninstallable, done)
+
+    def un_sort_by(self, key):
+        col, rev = self.un_sort
+        self.un_sort = (key, (not rev) if col == key else False)
+        self.un_render()
+
+    def un_render(self):
+        self.un_tree.delete(*self.un_tree.get_children())
+        q = self.un_filter.get().strip().lower()
+        key, rev = self.un_sort
+        rows = [(i, p) for i, p in enumerate(self.un_items)
+                if not q or q in p["name"].lower() or q in p["publisher"].lower()]
+        rows.sort(key=lambda t: (t[1][key].lower() if isinstance(t[1][key], str) else t[1][key]),
+                  reverse=rev)
+        for i, p in rows:
+            self.un_tree.insert("", "end", iid=str(i), values=(
+                "☑" if i in self.un_checked else "☐", p["name"], p["version"],
+                p["publisher"], sizefmt(p["size"]) if p["size"] else "", p["date"]))
+        self._upd_un_sum()
+
+    def un_click(self, ev):
+        if self.un_tree.identify_region(ev.x, ev.y) != "cell" or \
+                self.un_tree.identify_column(ev.x) != "#1":
+            return
+        iid = self.un_tree.identify_row(ev.y)
+        if iid:
+            i = int(iid)
+            self.un_checked.symmetric_difference_update({i})
+            self.un_tree.set(iid, "chk", "☑" if i in self.un_checked else "☐")
+            self._upd_un_sum()
+
+    def un_mark(self, on):
+        if on:
+            self.un_checked.update(int(i) for i in self.un_tree.get_children())
+        else:
+            self.un_checked.clear()
+        self.un_render()
+
+    def _upd_un_sum(self):
+        tot = sum(self.un_items[i]["size"] for i in self.un_checked)
+        self.un_sum.set(f"{len(self.un_checked)} marcado(s) - {sizefmt(tot)}")
+
+    def un_run(self):
+        sel = [self.un_items[i] for i in sorted(self.un_checked)]
+        if not sel:
+            messagebox.showinfo(APP_NAME, "Marque os programas que deseja desinstalar.")
+            return
+        names = "\n".join(f"- {p['name']}" for p in sel[:15]) + (f"\n... e mais {len(sel) - 15}" if len(sel) > 15 else "")
+        if not messagebox.askyesno(APP_NAME, f"Desinstalar {len(sel)} programa(s)?\n\n{names}\n\n"
+                                   "Salve seu trabalho antes. Alguns podem abrir janelas proprias.",
+                                   icon="warning"):
+            return
+        silent, restore = self.un_silent.get(), self.un_restore.get()
+        self.cancel_flag.clear()
+        self.un_btn.state(["disabled"])
+
+        def work():
+            results = []
+            if restore:
+                self.ui(self.say, "Criando ponto de restauracao...")
+                create_restore_point()
+            for n, p in enumerate(sel, 1):
+                if self.cancel_flag.is_set():
+                    break
+                self.ui(lambda n=n, p=p: (self.say(f"Desinstalando {n}/{len(sel)}: {p['name']}"),
+                                          self.un_prog.configure(value=(n - 1) / len(sel))))
+                results.append((p, *uninstall_one(p, silent)))
+            return results
+
+        def done(r, e):
+            self.un_btn.state(["!disabled"])
+            self.un_prog.configure(value=1.0)
+            r = r or []
+            ok = [x for x in r if x[1] == "ok"]
+            bad = [x for x in r if x[1] != "ok"]
+            msg = f"{len(ok)} removido(s), {len(bad)} falha(s)."
+            for p, st, det in bad[:8]:
+                msg += f"\n- {p['name']}: {det}"
+            if any(x[2] for x in ok):
+                msg += "\n\nAlgum programa pede para reiniciar o PC."
+            self.un_load()
+            if ok and messagebox.askyesno(APP_NAME, msg + "\n\nProcurar restos desses programas na aba Limpeza?"):
+                self.nb.select(self.nb.index("end") - 2)
+            else:
+                messagebox.showinfo(APP_NAME, msg)
+        self.bg(work, done)
 
     # ---- aba REGISTRO ------------------------------------------------------------
     def tab_log(self):

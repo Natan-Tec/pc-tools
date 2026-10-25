@@ -2,7 +2,7 @@
 
 Utilitario de seguranca e diagnostico para Windows (complemento ao Windows Defender).
 
-Abas: Hosts, Sistema, Disco, Integridade, Arquivos suspeitos, Limpeza, Registro.
+Abas: Hosts, Sistema, Disco, Integridade, Arquivos suspeitos, Desinstalador (em lote), Limpeza, Registro.
 
 ## Rodar
     pip install psutil
