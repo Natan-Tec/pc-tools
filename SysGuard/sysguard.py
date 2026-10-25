@@ -952,7 +952,7 @@ def uninstall_one(p, silent=True, timeout=1800):
         return "falha", "sem comando de desinstalacao"
     log(f"DESINSTALAR: {p['name']} -> {cmd}")
     try:
-        flags = 0x08000000 if (IS_WIN and is_silent) else 0
+        flags = 0x08000000 if IS_WIN else 0  # sem janela de console (janelas graficas dos instaladores continuam aparecendo)
         rc = subprocess.run(cmd, shell=True, timeout=timeout, creationflags=flags).returncode
     except subprocess.TimeoutExpired:
         return "falha", "tempo esgotado"
@@ -1037,6 +1037,12 @@ class App(tk.Tk):
         log(f"{APP_NAME} iniciado (admin={is_admin()})")
 
     # ---- infraestrutura ----------------------------------------------------
+    def report_callback_exception(self, exc, val, tb):
+        import traceback
+        text = "".join(traceback.format_exception(exc, val, tb))
+        log("ERRO NA INTERFACE:\n" + text)
+        messagebox.showerror(APP_NAME, f"Ocorreu um erro:\n{val}\n\nDetalhes no Registro / {LOG_FILE}")
+
     def _style(self):
         s = ttk.Style(self)
         s.theme_use("clam")
@@ -1814,7 +1820,27 @@ class App(tk.Tk):
         self.log_text.see("end")
 
 
+def detach_console():
+    """Windows: se foi aberto pelo python.exe (com terminal), reabre pelo pythonw.exe
+    (sem terminal) e fecha esta instancia. No EXE (--windowed) nao faz nada."""
+    if not IS_WIN or getattr(sys, "frozen", False):
+        return
+    exe = Path(sys.executable)
+    if exe.name.lower() == "python.exe":
+        pyw = exe.with_name("pythonw.exe")
+        if pyw.exists():
+            subprocess.Popen([str(pyw), *sys.argv],
+                             creationflags=0x00000008 | 0x08000000)  # DETACHED | NO_WINDOW
+            sys.exit(0)
+    # sem terminal nao existe stdout/stderr: evita erro em print() e guarda falhas no log
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(APP_DIR / "erros.log", "a", encoding="utf-8")
+
+
 def main():
+    detach_console()
     App().mainloop()
 
 
