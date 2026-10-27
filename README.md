@@ -1,4 +1,4 @@
-# pc-toolz
+# pc-tools
 
 Ferramentas para PC.
 
