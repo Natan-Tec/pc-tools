@@ -1,1 +1,4 @@
 psutil
+# opcionais:
+openrgb-python   # controle de RGB (precisa do OpenRGB aberto)
+pythonnet        # controle de ventoinhas (Windows + LibreHardwareMonitorLib.dll)
